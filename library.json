@@ -1,0 +1,11 @@
+{
+  "name": "MotusDrivers",
+  "version": "0.1.0",
+  "description": "Motus Drivers — stepper motor library for TB6600, DM556, A4988 and DRV8825",
+  "keywords": ["stepper", "motor", "cnc", "driver", "Motus"],
+  "platforms": ["atmelavr", "espressif32"],
+  "frameworks": ["arduino"],
+  "build": {
+    "srcDir": "src"
+  }
+}
