@@ -39,8 +39,9 @@ public:
   bool isStepDue() const;
   bool isStepDue(uint32_t nowUs) const;
   void pulseStep();
-  /** Pulso STEP sem delayMicroseconds (adequado a tick/ISR de alta frequência). */
+  /** Pulso STEP síncrono (HIGH → delay → LOW); no ESP32 usa `esp_rom_delay_us` + `gpio_set_level`. */
   void pulseStepIsr();
+
   void stepApplied();
   uint32_t nextStepInterval() const;
 
@@ -64,6 +65,10 @@ protected:
   bool _enInverted = false;
 
   float _speedStepsPerSec = 0.0f;
+  // Bresenham em Q8: acumula micros × 256 (sem float no acumulador)
+  uint32_t _intervalAccumQ8 = 0;
+  uint32_t _bresenhamSyncStepsDone = 0;
+
   uint32_t _accelMs = 0;
   uint32_t _decelMs = 0;
   AccelType _accelType = AccelType::Linear;
@@ -87,7 +92,7 @@ protected:
   uint32_t _decelSteps = 0;
 
   // Parâmetros específicos de driver (ex.: pulso mínimo em µs)
-  uint32_t _stepPulseUs = 3;
+  uint32_t _stepPulseUs = 1;
 
   // Direção "lógica" atual
   bool _dirForward = true;
@@ -96,5 +101,6 @@ protected:
   // Helpers internos
   void _applyEnable(bool on);
   void _applyDir(bool forward);
+  void _bresenhamEmitIntervalQ8(uint32_t intervalQ8);
 };
 

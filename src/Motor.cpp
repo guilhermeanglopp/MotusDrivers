@@ -1,5 +1,32 @@
 #include "Motor.h"
 
+#if defined(ESP32)
+#include "driver/gpio.h"
+#include "esp_attr.h"
+#include "rom/ets_sys.h"
+#include "soc/gpio_reg.h"
+#include "soc/soc.h"
+#define FK_MOTOR_IRAM IRAM_ATTR
+#else
+#define FK_MOTOR_IRAM
+#endif
+
+#if defined(ESP32)
+/** STEP/DIR costumam ser GPIO < 32: escrita direta no registo. Demais pinos: driver. */
+static inline void FK_MOTOR_IRAM fk_gpio_set_fast(uint8_t pin, uint32_t level) {
+  if (pin == 255)
+    return;
+  if (pin < 32) {
+    if (level)
+      REG_WRITE(GPIO_OUT_W1TS_REG, 1u << pin);
+    else
+      REG_WRITE(GPIO_OUT_W1TC_REG, 1u << pin);
+  } else {
+    gpio_set_level((gpio_num_t)pin, (int)level);
+  }
+}
+#endif
+
 static inline float _clampf01(float v) {
   if (v < 0.0f)
     return 0.0f;
@@ -71,6 +98,13 @@ void Motor::setDir(bool forward) {
 }
 
 void Motor::_applyEnable(bool on) {
+  if (!on && _stepPin != 255) {
+#if defined(ESP32)
+    fk_gpio_set_fast(_stepPin, 0);
+#else
+    digitalWrite(_stepPin, LOW);
+#endif
+  }
   _enabled = on;
   if (_enPin == 255)
     return;
@@ -87,6 +121,15 @@ void Motor::_applyDir(bool forward) {
 
   const uint8_t level = forward ? HIGH : LOW;
   digitalWrite(_dirPin, _dirInverted ? !level : level);
+}
+
+void Motor::_bresenhamEmitIntervalQ8(uint32_t intervalQ8) {
+  _intervalAccumQ8 += intervalQ8;
+  uint32_t whole = _intervalAccumQ8 >> 8;
+  if (whole < 1)
+    whole = 1;
+  _currentInterval = whole;
+  _intervalAccumQ8 -= (whole << 8);
 }
 
 bool Motor::isRunning() const { return _state != State::IDLE; }
@@ -131,9 +174,18 @@ void Motor::moveSteps(int32_t steps) {
   _currentInterval = 0;
   _plannerReady = false;
   _nextStepTime = micros();
+  _intervalAccumQ8 = 0;
+  _bresenhamSyncStepsDone = 0;
 }
 
 void Motor::stop() {
+  if (_stepPin != 255) {
+#if defined(ESP32)
+    fk_gpio_set_fast(_stepPin, 0);
+#else
+    digitalWrite(_stepPin, LOW);
+#endif
+  }
   _stepsRemaining = 0;
   _moveTotalSteps = 0;
   _stepsDone = 0;
@@ -141,6 +193,8 @@ void Motor::stop() {
   _currentInterval = 0;
   _plannerReady = false;
   _state = State::IDLE;
+  _intervalAccumQ8 = 0;
+  _bresenhamSyncStepsDone = 0;
 }
 
 void Motor::stopSmooth() {
@@ -153,7 +207,7 @@ uint32_t Motor::nextStepInterval() const { return _currentInterval; }
 
 bool Motor::isStepDue() const { return isStepDue(micros()); }
 
-bool Motor::isStepDue(uint32_t nowUs) const {
+bool FK_MOTOR_IRAM Motor::isStepDue(uint32_t nowUs) const {
   if (_state == State::IDLE)
     return false;
   if (_currentInterval == 0)
@@ -172,9 +226,16 @@ void Motor::pulseStep() {
   digitalWrite(_stepPin, LOW);
 }
 
-void Motor::pulseStepIsr() {
+void FK_MOTOR_IRAM Motor::pulseStepIsr() {
   if (_stepPin == 255)
     return;
+
+#if defined(ESP32)
+  fk_gpio_set_fast(_stepPin, 1);
+  if (_stepPulseUs > 0)
+    ets_delay_us(_stepPulseUs);
+  fk_gpio_set_fast(_stepPin, 0);
+#else
   digitalWrite(_stepPin, HIGH);
   if (_stepPulseUs > 0) {
     const uint32_t t0 = micros();
@@ -182,6 +243,7 @@ void Motor::pulseStepIsr() {
     }
   }
   digitalWrite(_stepPin, LOW);
+#endif
 }
 
 void Motor::stepApplied() {
@@ -206,10 +268,12 @@ void Motor::stepApplied() {
   // Transições de estado baseadas em passos
   if (_state == State::ACCEL && _accelSteps > 0 && _stepsDone >= _accelSteps) {
     _state = State::CRUISE;
+    _intervalAccumQ8 = 0;
   }
 
   if (_decelSteps > 0 && (uint32_t)_stepsRemaining <= _decelSteps) {
     _state = State::DECEL;
+    _intervalAccumQ8 = 0;
   }
 
   // Agenda o próximo passo usando o intervalo já calculado pelo Planner
@@ -237,8 +301,6 @@ void Motor::updatePlanner() {
   const float speedMin = (speedMax >= 10.0f) ? (speedMax / 10.0f) : 1.0f;
   const float intervalMinF = 1000000.0f / speedMax;
   const float intervalMaxF = 1000000.0f / speedMin;
-
-  // _accelSteps e _decelSteps já foram calculados em moveSteps() — não recalcular aqui.
 
   float factor = 1.0f;
 
@@ -268,17 +330,37 @@ void Motor::updatePlanner() {
 
   const float intervalF =
       intervalMaxF - (intervalMaxF - intervalMinF) * _clampf01(factor);
-  uint32_t interval = (uint32_t)(intervalF + 0.5f);
-  if (interval < 1)
-    interval = 1;
-  _currentInterval = interval;
 
-  // ── Inicializa _nextStepTime apenas na primeira execução do Planner ──────
-  // Usa flag _plannerReady em vez de checar _nextStepTime == 0,
-  // evitando ambiguidade com overflow do micros().
+  uint32_t intervalQ8 = (uint32_t)(intervalF * 256.0f + 0.5f);
+  if (intervalQ8 < 256u)
+    intervalQ8 = 256u;
+
+  // Bresenham deve ser "consumido" no ritmo dos PASSOS, não no ritmo do loop().
+  // `updatePlanner()` pode rodar centenas de vezes entre dois steps, então
+  // sincronizamos com `stepsDone` (lido atomicamente acima).
+
   if (!_plannerReady) {
+    // Primeira inicialização do movimento: emite 1 intervalo e agenda o primeiro step.
+    _bresenhamSyncStepsDone = stepsDone;
+    _bresenhamEmitIntervalQ8(intervalQ8);
     _nextStepTime = micros() + _currentInterval;
     _plannerReady = true;
+    return;
+  }
+
+  // Emite exatamente 1 intervalo por passo efetivamente aplicado.
+  while (_bresenhamSyncStepsDone < stepsDone) {
+    _bresenhamSyncStepsDone++;
+    _bresenhamEmitIntervalQ8(intervalQ8);
+  }
+
+  // Antes do 1º passo físico, a rampa pode mudar entre chamadas do planner.
+  // Atualiza _currentInterval seguindo intervalF sem acumular várias vezes.
+  if (stepsDone == 0) {
+    uint32_t iv = (intervalQ8 + 128u) >> 8;
+    if (iv < 1)
+      iv = 1;
+    _currentInterval = iv;
   }
 }
 

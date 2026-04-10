@@ -1,37 +1,49 @@
 /**
  * Passo 8 — 03_multiaxis_isr
  *
- * Três motores, um único esp_timer → drivers.tick() (maestro).
+ * Três motores: ESP32 → hw_timer periódico → drivers.tick() (maestro).
  * loop(): apenas drivers.run() (planner) + LED.
  *
  * X/Y proporcionais: relação passos/velocidade igual → tempo de cruzeiro parecido.
  * Z independente: perfil e passos diferentes (tende a terminar em outro instante).
  *
- * Medição de tempo de varredura (< 20 µs): use osciloscópio num pino auxiliar
- * ou temporariamente faça digitalWrite alto/baixo em volta de drivers.tick() no callback.
+ * Medição: osciloscópio no tick (pino auxiliar em volta de drivers.tick()) ou STEP.
  */
 
 #include <Arduino.h>
 #include <MotusDrivers.h>
+#if !defined(ESP32)
 #include <esp_timer.h>
+#endif
+
+#define LED_BUILTIN 2
 
 // --- Eixos (ajuste ao hardware) ---
 static constexpr uint8_t X_STEP = 18, X_DIR = 19, X_EN = 21;
 static constexpr uint8_t Y_STEP = 22, Y_DIR = 23, Y_EN = 25;
 static constexpr uint8_t Z_STEP = 26, Z_DIR = 27, Z_EN = 32;
 
-static constexpr uint64_t TIMER_PERIOD_US = 50;
+static constexpr uint64_t TIMER_PERIOD_US = 10;
 
 static MotusDrivers drivers;
 static Motor *motorX = nullptr;
 static Motor *motorY = nullptr;
 static Motor *motorZ = nullptr;
+
+#if defined(ESP32)
+static hw_timer_t *s_hwTimer = nullptr;
+
+static void IRAM_ATTR fk_timer_isr() {
+  drivers.tick();
+}
+#else
 static esp_timer_handle_t s_fkTimer = nullptr;
 
 static void fk_timer_cb(void *arg) {
   (void)arg;
   drivers.tick();
 }
+#endif
 
 void setup() {
   Serial.begin(115200);
@@ -74,13 +86,17 @@ void setup() {
 
   motorX->moveSteps(stepsX);
   motorY->moveSteps(stepsY);
-  // Z: menos passos — costuma parar antes (eixo “independente”)
   motorZ->moveSteps(480);
 
+#if defined(ESP32)
+  s_hwTimer = timerBegin(0, 80, true);
+  timerAttachInterrupt(s_hwTimer, &fk_timer_isr, true);
+  timerAlarmWrite(s_hwTimer, TIMER_PERIOD_US, true);
+  timerAlarmEnable(s_hwTimer);
+#else
   esp_timer_create_args_t cfg = {};
   cfg.callback = &fk_timer_cb;
   cfg.name = "fk_tick_maestro";
-
   if (esp_timer_create(&cfg, &s_fkTimer) != ESP_OK ||
       esp_timer_start_periodic(s_fkTimer, TIMER_PERIOD_US) != ESP_OK) {
     Serial.println(F("esp_timer falhou"));
@@ -88,6 +104,7 @@ void setup() {
       delay(1000);
     }
   }
+#endif
 }
 
 void loop() {

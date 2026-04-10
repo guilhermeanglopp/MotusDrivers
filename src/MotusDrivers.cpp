@@ -2,6 +2,13 @@
 
 #include <new>
 
+#if defined(ESP32)
+#include "esp_attr.h"
+#define FK_TICK_IRAM IRAM_ATTR
+#else
+#define FK_TICK_IRAM
+#endif
+
 GenericStepDir &MotusDrivers::_genericOverflow() {
   return *reinterpret_cast<GenericStepDir *>(_genericRaw[0]);
 }
@@ -55,14 +62,16 @@ SoftwareMS &MotusDrivers::setupDRV8825(uint8_t step, uint8_t dir, uint8_t en,
 }
 
 void MotusDrivers::beginAll() {
-  for (uint8_t i = 0; i < _motorCount; i++) {
+  const uint8_t n = _motorCount;
+  for (uint8_t i = 0; i < n; i++) {
     if (_motors[i])
       _motors[i]->begin();
   }
 }
 
 void MotusDrivers::run() {
-  for (uint8_t i = 0; i < _motorCount; i++) {
+  const uint8_t n = _motorCount;
+  for (uint8_t i = 0; i < n; i++) {
     if (_motors[i])
       _motors[i]->updatePlanner();
   }
@@ -70,22 +79,25 @@ void MotusDrivers::run() {
   if (_isrMode)
     return;
 
-  const uint32_t now = micros();
-  for (uint8_t i = 0; i < _motorCount; i++) {
+  uint32_t now = micros();
+  for (uint8_t i = 0; i < n; i++) {
     Motor *m = _motors[i];
     if (!m)
       continue;
     if (m->isStepDue(now)) {
       m->pulseStep();
       m->stepApplied();
+      now = micros();
     }
   }
 }
 
-bool MotusDrivers::tick() {
-  const uint32_t now = micros();
+bool FK_TICK_IRAM MotusDrivers::tick() {
+  uint32_t now = micros();
   bool stepped = false;
-  for (uint8_t i = 0; i < _motorCount; i++) {
+  const uint8_t n = _motorCount;
+
+  for (uint8_t i = 0; i < n; i++) {
     Motor *m = _motors[i];
     if (!m)
       continue;
@@ -93,7 +105,11 @@ bool MotusDrivers::tick() {
       m->pulseStepIsr();
       m->stepApplied();
       stepped = true;
+      // `pulseStepIsr()` consome alguns µs (e com múltiplos motores soma).
+      // Reamostrar `micros()` aqui reduz viés temporal entre eixos no mesmo scan.
+      now = micros();
     }
   }
+
   return stepped;
 }

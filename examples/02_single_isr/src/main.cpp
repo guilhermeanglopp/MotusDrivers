@@ -1,31 +1,45 @@
 /**
  * Passo 7 — 02_single_isr
  *
- * - loop(): apenas drivers.run() → atualiza o Planner (setIsrMode(true)).
- * - esp_timer periódico: drivers.tick() → aplica pulsos STEP.
+ * - loop(): apenas drivers.run() → Planner (setIsrMode(true)).
+ * - ESP32: hw_timer periódico → drivers.tick() (maestro; melhor que esp_timer para 10µs).
+ * - Outros alvos: esp_timer periódico → drivers.tick().
  *
  * Ajuste STEP_PIN / DIR_PIN / EN_PIN. LED_BUILTIN pisca no loop (validação de loop livre).
  */
 
 #include <Arduino.h>
 #include <MotusDrivers.h>
+#if !defined(ESP32)
 #include <esp_timer.h>
+#endif
+
+#define LED_BUILTIN 2
 
 static constexpr uint8_t STEP_PIN = 18;
 static constexpr uint8_t DIR_PIN = 19;
 static constexpr uint8_t EN_PIN = 21;
 
-/** Período do timer em µs: quanto menor, mais resolução para isStepDue (custo de CPU). */
-static constexpr uint64_t TIMER_PERIOD_US = 50;
+/** Período do tick em µs (10 = boa resolução; subir para 25–50 se CPU apertar). */
+static constexpr uint64_t TIMER_PERIOD_US = 10;
 
 static MotusDrivers drivers;
 static Motor *motor = nullptr;
+
+#if defined(ESP32)
+static hw_timer_t *s_hwTimer = nullptr;
+
+static void IRAM_ATTR fk_timer_isr() {
+  drivers.tick();
+}
+#else
 static esp_timer_handle_t s_fkTimer = nullptr;
 
 static void fk_timer_cb(void *arg) {
   (void)arg;
   drivers.tick();
 }
+#endif
 
 void setup() {
   Serial.begin(115200);
@@ -45,25 +59,24 @@ void setup() {
   motor->enable();
   motor->moveSteps(6400);
 
+#if defined(ESP32)
+  s_hwTimer = timerBegin(0, 80, true);
+  timerAttachInterrupt(s_hwTimer, &fk_timer_isr, true);
+  timerAlarmWrite(s_hwTimer, TIMER_PERIOD_US, true);
+  timerAlarmEnable(s_hwTimer);
+#else
   esp_timer_create_args_t cfg = {};
   cfg.callback = &fk_timer_cb;
   cfg.name = "fk_tick";
 
-  esp_err_t err = esp_timer_create(&cfg, &s_fkTimer);
-  if (err != ESP_OK) {
-    Serial.println(F("esp_timer_create falhou"));
+  if (esp_timer_create(&cfg, &s_fkTimer) != ESP_OK ||
+      esp_timer_start_periodic(s_fkTimer, TIMER_PERIOD_US) != ESP_OK) {
+    Serial.println(F("esp_timer falhou"));
     while (true) {
       delay(1000);
     }
   }
-
-  err = esp_timer_start_periodic(s_fkTimer, TIMER_PERIOD_US);
-  if (err != ESP_OK) {
-    Serial.println(F("esp_timer_start_periodic falhou"));
-    while (true) {
-      delay(1000);
-    }
-  }
+#endif
 }
 
 void loop() {

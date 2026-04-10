@@ -1,41 +1,51 @@
 /**
  * Passo 9 — 04_esp32_task
  *
- * ESP32 (Arduino-ESP32): a task do `loop()` normalmente roda no Core 1 com
- * prioridade baixa. Uma segunda task no MESMO core com prioridade 24 (como no
- * modelo antigo) pode **matar de fome** o `loop()` → `drivers.run()` nunca roda
- * → `_currentInterval` fica 0 → **nenhum pulso em STEP**.
+ * ESP32 (Arduino-ESP32): o `loop()` costuma ser prioridade baixa no core 1.
+ * O maestro dos passos deve ser periódico e previsível: **hw_timer** (não esp_timer
+ * se precisares de 10µs estáveis) chama `drivers.tick()`.
  *
- * Arquitetura corrigida (alinhada ao ISR_vs_TASK_Comparison.md):
- * - **esp_timer** periódico → `drivers.tick()` (executor / maestro)
+ * Arquitetura:
+ * - **hw_timer** periódico → `drivers.tick()` (executor)
  * - **loop()** → `drivers.run()` (planner, float)
- * - **Task no Core 1** (baixa prioridade) → telemetria + `uxTaskGetStackHighWaterMark`
- *
- * Ajuste os pinos conforme seu hardware.
+ * - **Task no Core 1** (prioridade baixa) → telemetria + stack watermark
  */
 
 #include <Arduino.h>
 #include <MotusDrivers.h>
+#if !defined(ESP32)
 #include <esp_timer.h>
+#endif
+
+#define LED_BUILTIN 2
 
 static constexpr uint8_t X_STEP = 18, X_DIR = 19, X_EN = 21;
 static constexpr uint8_t Y_STEP = 22, Y_DIR = 23, Y_EN = 25;
 static constexpr uint8_t Z_STEP = 26, Z_DIR = 27, Z_EN = 32;
 
-static constexpr uint64_t TIMER_PERIOD_US = 50;
+static constexpr uint64_t TIMER_PERIOD_US = 10;
 
 static MotusDrivers drivers;
 static Motor *mx = nullptr;
 static Motor *my = nullptr;
 static Motor *mz = nullptr;
 
+#if defined(ESP32)
+static hw_timer_t *s_hwTimer = nullptr;
+
+static void IRAM_ATTR fk_timer_isr() {
+  drivers.tick();
+}
+#else
 static esp_timer_handle_t s_fkTimer = nullptr;
-static TaskHandle_t s_monitorTask = nullptr;
 
 static void fk_timer_cb(void *arg) {
   (void)arg;
   drivers.tick();
 }
+#endif
+
+static TaskHandle_t s_monitorTask = nullptr;
 
 static void monitorTask(void *param) {
   (void)param;
@@ -89,6 +99,12 @@ void setup() {
   my->moveSteps(6400);
   mz->moveSteps(9600);
 
+#if defined(ESP32)
+  s_hwTimer = timerBegin(0, 80, true);
+  timerAttachInterrupt(s_hwTimer, &fk_timer_isr, true);
+  timerAlarmWrite(s_hwTimer, TIMER_PERIOD_US, true);
+  timerAlarmEnable(s_hwTimer);
+#else
   esp_timer_create_args_t tcfg = {};
   tcfg.callback = &fk_timer_cb;
   tcfg.name = "fk_tick";
@@ -99,8 +115,8 @@ void setup() {
       delay(1000);
     }
   }
+#endif
 
-  // Task só para monitoramento (prioridade baixa — não compete com o loop/planner)
   xTaskCreatePinnedToCore(monitorTask, "fk_monitor", 4096, nullptr, 1,
                           &s_monitorTask, 1);
 }
