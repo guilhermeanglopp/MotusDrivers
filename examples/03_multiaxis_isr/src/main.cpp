@@ -1,0 +1,134 @@
+/**
+ * Passo 8 — 03_multiaxis_isr
+ *
+ * Três motores: ESP32 → hw_timer periódico → drivers.tick() (maestro).
+ * loop(): apenas drivers.run() (planner) + LED.
+ *
+ * X/Y proporcionais: relação passos/velocidade igual → tempo de cruzeiro parecido.
+ * Z independente: perfil e passos diferentes (tende a terminar em outro instante).
+ *
+ * Medição: osciloscópio no tick (pino auxiliar em volta de drivers.tick()) ou STEP.
+ */
+
+#include <Arduino.h>
+#include <MotusDrivers.h>
+#if !defined(ESP32)
+#include <esp_timer.h>
+#endif
+
+#define LED_BUILTIN 2
+
+// --- Eixos (ajuste ao hardware) ---
+static constexpr uint8_t X_STEP = 18, X_DIR = 19, X_EN = 21;
+static constexpr uint8_t Y_STEP = 22, Y_DIR = 23, Y_EN = 25;
+static constexpr uint8_t Z_STEP = 26, Z_DIR = 27, Z_EN = 32;
+
+static constexpr uint64_t TIMER_PERIOD_US = 10;
+
+static MotusDrivers drivers;
+static Motor *motorX = nullptr;
+static Motor *motorY = nullptr;
+static Motor *motorZ = nullptr;
+
+#if defined(ESP32)
+static hw_timer_t *s_hwTimer = nullptr;
+
+// ISR: um tick serve os três eixos registados.
+static void IRAM_ATTR fk_timer_isr() {
+  drivers.tick();
+}
+#else
+static esp_timer_handle_t s_fkTimer = nullptr;
+
+// Timer software: chama o maestro para todos os motores.
+static void fk_timer_cb(void *arg) {
+  (void)arg;
+  drivers.tick();
+}
+#endif
+
+// Três TB6600, perfis e passos diferentes; arranca timer de tick.
+void setup() {
+  Serial.begin(115200);
+  delay(200);
+
+  pinMode(LED_BUILTIN, OUTPUT);
+
+  motorX = &drivers.setupTB6600(X_STEP, X_DIR, X_EN);
+  motorY = &drivers.setupTB6600(Y_STEP, Y_DIR, Y_EN);
+  motorZ = &drivers.setupTB6600(Z_STEP, Z_DIR, Z_EN);
+
+  drivers.setIsrMode(true);
+  drivers.beginAll();
+
+  // X/Y: mesma razão passos/velocidade → deslocamento proporcional e fim ~alinhado
+  const int32_t stepsX = 3200;
+  const int32_t stepsY = 1600;
+  const float vX = 1600.0f;
+  const float vY = 800.0f;
+
+  motorX->setSpeedStepsPerSec(vX);
+  motorY->setSpeedStepsPerSec(vY);
+  motorZ->setSpeedStepsPerSec(1200.0f);
+
+  motorX->setAccelerationTimeMs(280);
+  motorY->setAccelerationTimeMs(280);
+  motorZ->setAccelerationTimeMs(200);
+
+  motorX->setDecelerationTimeMs(280);
+  motorY->setDecelerationTimeMs(280);
+  motorZ->setDecelerationTimeMs(200);
+
+  motorX->setAccelerationType(AccelType::Linear);
+  motorY->setAccelerationType(AccelType::Linear);
+  motorZ->setAccelerationType(AccelType::Linear);
+
+  motorX->enable();
+  motorY->enable();
+  motorZ->enable();
+
+  motorX->moveSteps(stepsX);
+  motorY->moveSteps(stepsY);
+  motorZ->moveSteps(480);
+
+#if defined(ESP32)
+  s_hwTimer = timerBegin(0, 80, true);
+  timerAttachInterrupt(s_hwTimer, &fk_timer_isr, true);
+  timerAlarmWrite(s_hwTimer, TIMER_PERIOD_US, true);
+  timerAlarmEnable(s_hwTimer);
+#else
+  esp_timer_create_args_t cfg = {};
+  cfg.callback = &fk_timer_cb;
+  cfg.name = "fk_tick_maestro";
+  if (esp_timer_create(&cfg, &s_fkTimer) != ESP_OK ||
+      esp_timer_start_periodic(s_fkTimer, TIMER_PERIOD_US) != ESP_OK) {
+    Serial.println(F("esp_timer falhou"));
+    while (true) {
+      delay(1000);
+    }
+  }
+#endif
+}
+
+// Planner contínuo; mensagens separadas quando Z para e quando X+Y param.
+void loop() {
+  drivers.run();
+
+  static uint32_t lastMs = 0;
+  const uint32_t now = millis();
+  if (now - lastMs >= 500) {
+    lastMs = now;
+    digitalWrite(LED_BUILTIN, !digitalRead(LED_BUILTIN));
+  }
+
+  static bool saidZ = false;
+  static bool saidXY = false;
+  if (!saidZ && motorZ && !motorZ->isRunning()) {
+    Serial.println(F("Z parou (independente)."));
+    saidZ = true;
+  }
+  if (!saidXY && motorX && motorY && !motorX->isRunning() && !motorY->isRunning()) {
+    Serial.println(F("X e Y pararam (~proporcional)."));
+    saidXY = true;
+  }
+}
